@@ -1,0 +1,88 @@
+# Local development stack: server + Postgres + MinIO (S3-compatible).
+#
+# Usage:
+#   docker compose up -d          # start all services
+#   docker compose logs -f server # follow server logs
+#   docker compose down           # tear down
+#
+# The server uses the River queue driver (Postgres-backed), so no
+# separate Redis or QStash service is needed for local dev.
+
+services:
+  # ── Postgres ───────────────────────────────────────────────────
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: vectorless
+      POSTGRES_PASSWORD: vectorless
+      POSTGRES_DB: vectorless
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vectorless"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── MinIO (S3-compatible storage) ──────────────────────────────
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+
+  # Create the default bucket on first start.
+  minio-setup:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+        sleep 2 &&
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing local/vectorless &&
+        echo 'bucket ready'
+      "
+
+  # ── Vectorless Server ──────────────────────────────────────────
+  server:
+    build:
+      context: .
+      args:
+        VERSION: "dev-compose"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-setup:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+    environment:
+      # Server config via env vars (no config file needed).
+      VLS_ADDR: ":8080"
+      VLS_AUTH_MODE: "none"
+      VLS_DATABASE_URL: "postgres://vectorless:vectorless@postgres:5432/vectorless?sslmode=disable"
+      VLS_STORAGE_DRIVER: "s3"
+      VLE_STORAGE_S3_ENDPOINT: "http://minio:9000"
+      VLE_STORAGE_S3_REGION: "us-east-1"
+      VLE_STORAGE_S3_BUCKET: "vectorless"
+      VLE_STORAGE_S3_ACCESS_KEY: "minioadmin"
+      VLE_STORAGE_S3_SECRET_KEY: "minioadmin"
+      VLE_STORAGE_S3_USE_PATH_STYLE: "true"
+      VLS_QUEUE_DRIVER: "river"
+      VLS_LLM_DRIVER: "anthropic"
+      VLS_ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      VLS_LOG_LEVEL: "debug"
+    command: ["--role", "server"]
+
+volumes:
+  pgdata:
+  miniodata:

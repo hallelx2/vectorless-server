@@ -1,0 +1,291 @@
+package handler
+
+import (
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+
+	"github.com/hallelx2/vectorless-engine/pkg/db"
+	"github.com/hallelx2/vectorless-engine/pkg/ingest"
+	"github.com/hallelx2/vectorless-engine/pkg/queue"
+	"github.com/hallelx2/vectorless-engine/pkg/storage"
+	"github.com/hallelx2/vectorless-engine/pkg/tree"
+)
+
+// DocumentsHandler implements the documents and sections API surface.
+type DocumentsHandler struct {
+	logger  *slog.Logger
+	db      *db.Pool
+	storage storage.Storage
+	queue   queue.Queue
+}
+
+// NewDocumentsHandler creates a DocumentsHandler.
+func NewDocumentsHandler(
+	logger *slog.Logger,
+	pool *db.Pool,
+	store storage.Storage,
+	q queue.Queue,
+) *DocumentsHandler {
+	return &DocumentsHandler{
+		logger:  logger,
+		db:      pool,
+		storage: store,
+		queue:   q,
+	}
+}
+
+// HandleListDocuments returns a paginated list of documents.
+//
+// Query params:
+//   - limit  — page size, clamped to [1, 200], default 50
+//   - status — optional filter by lifecycle status
+//   - cursor — RFC3339Nano timestamp from previous page's next_cursor
+func (h *DocumentsHandler) HandleListDocuments(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	opts := db.ListDocumentsOpts{
+		Status: db.DocumentStatus(q.Get("status")),
+	}
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			opts.Limit = n
+		}
+	}
+	if v := q.Get("cursor"); v != "" {
+		if t, err := time.Parse(time.RFC3339Nano, v); err == nil {
+			opts.Cursor = t
+		}
+	}
+
+	docs, next, err := h.db.ListDocuments(r.Context(), opts)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	items := make([]map[string]any, 0, len(docs))
+	for _, doc := range docs {
+		items = append(items, map[string]any{
+			"id":           doc.ID,
+			"title":        doc.Title,
+			"content_type": doc.ContentType,
+			"status":       string(doc.Status),
+			"byte_size":    doc.ByteSize,
+			"created_at":   doc.CreatedAt,
+			"updated_at":   doc.UpdatedAt,
+		})
+	}
+	resp := map[string]any{"items": items}
+	if !next.IsZero() {
+		resp["next_cursor"] = next.Format(time.RFC3339Nano)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// HandleIngestDocument accepts a document via either multipart/form-data
+// (field name: "file") or JSON body {"content": "...", "filename": "..."}.
+// Returns 202 Accepted with the document_id in "pending" state.
+func (h *DocumentsHandler) HandleIngestDocument(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	docID := ingest.NewDocumentID()
+
+	var (
+		filename    string
+		contentType string
+		body        io.Reader
+		size        int64
+	)
+
+	ct := r.Header.Get("Content-Type")
+	switch {
+	case strings.HasPrefix(ct, "multipart/form-data"):
+		if err := r.ParseMultipartForm(32 << 20); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid multipart body: "+err.Error())
+			return
+		}
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, `missing form field "file"`)
+			return
+		}
+		defer file.Close()
+		filename = header.Filename
+		contentType = header.Header.Get("Content-Type")
+		body = file
+		size = header.Size
+
+	case strings.HasPrefix(ct, "application/json"):
+		var payload struct {
+			Filename    string `json:"filename"`
+			ContentType string `json:"content_type"`
+			Content     string `json:"content"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
+			return
+		}
+		if payload.Content == "" {
+			writeErr(w, http.StatusBadRequest, `"content" is required`)
+			return
+		}
+		filename = payload.Filename
+		contentType = payload.ContentType
+		body = strings.NewReader(payload.Content)
+		size = int64(len(payload.Content))
+
+	default:
+		writeErr(w, http.StatusUnsupportedMediaType,
+			"use multipart/form-data (file) or application/json (content)")
+		return
+	}
+
+	if contentType == "" {
+		contentType = guessContentType(filename)
+	}
+
+	key := ingest.SourceKey(docID, filename)
+	if err := h.storage.Put(ctx, key, body, storage.Metadata{
+		Key: key, Size: size, ContentType: contentType,
+	}); err != nil {
+		h.logger.Error("ingest: storage put failed", "err", err)
+		writeErr(w, http.StatusInternalServerError, "storage write failed")
+		return
+	}
+
+	title := filename
+	if title == "" {
+		title = string(docID)
+	}
+
+	if err := h.db.NewDocument(ctx, db.Document{
+		ID:          docID,
+		Title:       title,
+		ContentType: contentType,
+		SourceRef:   key,
+		Status:      db.StatusPending,
+		ByteSize:    size,
+	}); err != nil {
+		h.logger.Error("ingest: db insert failed", "err", err)
+		writeErr(w, http.StatusInternalServerError, "db write failed")
+		return
+	}
+
+	payload, _ := json.Marshal(ingest.Payload{
+		DocumentID:  docID,
+		ContentType: contentType,
+		Filename:    filename,
+		SourceRef:   key,
+	})
+	if err := h.queue.Enqueue(ctx, queue.Job{
+		Kind:      queue.KindIngestDocument,
+		Payload:   payload,
+		DedupeKey: string(docID),
+	}); err != nil {
+		h.logger.Error("ingest: enqueue failed", "err", err)
+		writeErr(w, http.StatusInternalServerError, "enqueue failed")
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"document_id": docID,
+		"status":      string(db.StatusPending),
+	})
+}
+
+// HandleGetDocument returns metadata and lifecycle status for one document.
+func (h *DocumentsHandler) HandleGetDocument(w http.ResponseWriter, r *http.Request) {
+	id := tree.DocumentID(chi.URLParam(r, "id"))
+	doc, err := h.db.GetDocument(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "document not found")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":            doc.ID,
+		"title":         doc.Title,
+		"content_type":  doc.ContentType,
+		"status":        string(doc.Status),
+		"byte_size":     doc.ByteSize,
+		"error_message": doc.ErrorMessage,
+		"metadata":      doc.Metadata,
+		"created_at":    doc.CreatedAt,
+		"updated_at":    doc.UpdatedAt,
+	})
+}
+
+// HandleDeleteDocument removes a document and cascades to its sections.
+func (h *DocumentsHandler) HandleDeleteDocument(w http.ResponseWriter, r *http.Request) {
+	id := tree.DocumentID(chi.URLParam(r, "id"))
+	if err := h.db.DeleteDocument(r.Context(), id); err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "document not found")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// HandleGetTree returns the compact tree view used for LLM reasoning.
+func (h *DocumentsHandler) HandleGetTree(w http.ResponseWriter, r *http.Request) {
+	id := tree.DocumentID(chi.URLParam(r, "id"))
+	t, err := h.db.LoadTree(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "document not found")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, t.BuildView())
+}
+
+// HandleGetSection returns a single section with full content from storage.
+func (h *DocumentsHandler) HandleGetSection(w http.ResponseWriter, r *http.Request) {
+	id := tree.SectionID(chi.URLParam(r, "id"))
+	sec, err := h.db.GetSection(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "section not found")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	var content string
+	if sec.ContentRef != "" {
+		rc, _, getErr := h.storage.Get(r.Context(), sec.ContentRef)
+		if getErr == nil {
+			raw, _ := io.ReadAll(rc)
+			rc.Close()
+			content = string(raw)
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":          sec.ID,
+		"document_id": sec.DocumentID,
+		"parent_id":   sec.ParentID,
+		"ordinal":     sec.Ordinal,
+		"depth":       sec.Depth,
+		"title":       sec.Title,
+		"summary":     sec.Summary,
+		"token_count": sec.TokenCount,
+		"metadata":    sec.Metadata,
+		"content":     content,
+	})
+}

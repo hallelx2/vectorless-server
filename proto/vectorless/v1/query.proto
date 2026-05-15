@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package vectorless.v1;
+
+option go_package = "github.com/hallelx2/vectorless-server/gen/vectorless/v1;vectorlessv1";
+
+// QueryService runs structure-aware retrieval against a document's tree.
+//
+// The engine loads the document tree, invokes the configured retrieval
+// strategy (single-pass or chunked-tree), and returns the sections the
+// model judged relevant — with full content, not fragments.
+service QueryService {
+  // Query retrieves sections relevant to a natural-language query.
+  rpc Query(QueryRequest) returns (QueryResponse);
+
+  // QueryStream is the streaming variant — sections are returned as
+  // they are selected, before the full strategy run completes.
+  // Phase 3: not yet implemented.
+  // rpc QueryStream(QueryRequest) returns (stream QueryStreamEvent);
+}
+
+message QueryRequest {
+  // The document to query against.
+  string document_id = 1;
+
+  // The natural-language query.
+  string query = 2;
+
+  // Optional: override the LLM model used for retrieval.
+  string model = 3;
+
+  // Optional: maximum context window tokens. Default 100,000.
+  int32 max_tokens = 4;
+
+  // Optional: tokens reserved for system prompt + response. Default 4,000.
+  int32 reserved_for_prompt = 5;
+
+  // Optional: max parallel LLM calls for chunked-tree. Default 8.
+  int32 max_parallel_calls = 6;
+
+  // Optional: cap on the number of returned sections. 0 = no cap.
+  int32 max_sections = 7;
+}
+
+message QueryResponse {
+  string document_id = 1;
+  string query = 2;
+  string strategy = 3;
+  string model = 4;
+  repeated QuerySection sections = 5;
+  int64 elapsed_ms = 6;
+}
+
+message QuerySection {
+  string id = 1;
+  string parent_id = 2;
+  string title = 3;
+  string summary = 4;
+  int32 token_count = 5;
+
+  // Full section content from storage.
+  string content = 6;
+}

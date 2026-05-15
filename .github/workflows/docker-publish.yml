@@ -1,0 +1,88 @@
+name: docker-publish
+
+# Build and publish the server Docker image to GitHub Container Registry.
+# Note: the server's build context is the project root because the
+# Dockerfile pulls in vectorless-engine and llmgate as sibling Go modules.
+# When this workflow runs in CI, the engine + llmgate sources are vendored
+# (committed) under ./vendor-* — see the build setup below.
+#
+# Resulting tags:
+#   ghcr.io/hallelx2/vectorless-server:main
+#   ghcr.io/hallelx2/vectorless-server:sha-<7chars>
+#   ghcr.io/hallelx2/vectorless-server:vX.Y.Z
+#   ghcr.io/hallelx2/vectorless-server:latest        (only on release tags)
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # If you keep the engine + llmgate as Git submodules, uncomment:
+          # submodules: recursive
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract tags + labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/vectorless-server
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      # The server Dockerfile's COPY statements reach for
+      # ../vectorless-engine and ../llmgate. CI checks out the server
+      # repo alone, so we clone those siblings into a working dir and
+      # build from that combined root.
+      - name: Clone sibling repos (engine + llmgate)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/vectorless-project
+          cp -r . /tmp/vectorless-project/vectorless-server
+          git clone --depth 1 \
+            https://github.com/${{ github.repository_owner }}/vectorless-engine.git \
+            /tmp/vectorless-project/vectorless-engine
+          git clone --depth 1 \
+            https://github.com/${{ github.repository_owner }}/llmgate.git \
+            /tmp/vectorless-project/llmgate || \
+            echo "(llmgate clone failed — make the repo public or vendor it)"
+
+      - name: Build + push
+        uses: docker/build-push-action@v6
+        with:
+          context: /tmp/vectorless-project
+          file: /tmp/vectorless-project/vectorless-server/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
