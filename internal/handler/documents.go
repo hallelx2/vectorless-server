@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -42,15 +43,33 @@ func NewDocumentsHandler(
 	}
 }
 
-// HandleListDocuments returns a paginated list of documents.
+// requireOrgID pulls the X-Vectorless-Org header (injected by the
+// control plane on every authenticated request) and writes a 400 if
+// it's missing. Returns the org id and true on success.
+func requireOrgID(w http.ResponseWriter, r *http.Request) (string, bool) {
+	org := r.Header.Get("X-Vectorless-Org")
+	if org == "" {
+		writeErr(w, http.StatusBadRequest, "missing X-Vectorless-Org header")
+		return "", false
+	}
+	return org, true
+}
+
+// HandleListDocuments returns a paginated list of documents for the
+// org identified by the X-Vectorless-Org header.
 //
 // Query params:
 //   - limit  — page size, clamped to [1, 200], default 50
 //   - status — optional filter by lifecycle status
 //   - cursor — RFC3339Nano timestamp from previous page's next_cursor
 func (h *DocumentsHandler) HandleListDocuments(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := requireOrgID(w, r)
+	if !ok {
+		return
+	}
 	q := r.URL.Query()
 	opts := db.ListDocumentsOpts{
+		OrgID:  orgID,
 		Status: db.DocumentStatus(q.Get("status")),
 	}
 	if v := q.Get("limit"); v != "" {
@@ -73,26 +92,60 @@ func (h *DocumentsHandler) HandleListDocuments(w http.ResponseWriter, r *http.Re
 	items := make([]map[string]any, 0, len(docs))
 	for _, doc := range docs {
 		items = append(items, map[string]any{
+			"doc_id":       doc.ID,
 			"id":           doc.ID,
 			"title":        doc.Title,
 			"content_type": doc.ContentType,
+			"source_type":  sourceTypeFromContentType(doc.ContentType),
 			"status":       string(doc.Status),
 			"byte_size":    doc.ByteSize,
 			"created_at":   doc.CreatedAt,
 			"updated_at":   doc.UpdatedAt,
 		})
 	}
-	resp := map[string]any{"items": items}
+	// Dashboard expects {documents, next_cursor, has_more}; the older
+	// {items} shape is kept as an alias for any SDK callers that
+	// already key off it.
+	resp := map[string]any{
+		"documents": items,
+		"items":     items,
+		"has_more":  !next.IsZero(),
+	}
 	if !next.IsZero() {
 		resp["next_cursor"] = next.Format(time.RFC3339Nano)
+	} else {
+		resp["next_cursor"] = nil
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// sourceTypeFromContentType collapses an HTTP Content-Type to the
+// short tag the dashboard's source-type badge expects.
+func sourceTypeFromContentType(ct string) string {
+	switch {
+	case strings.HasPrefix(ct, "application/pdf"):
+		return "pdf"
+	case strings.HasPrefix(ct, "text/markdown"):
+		return "markdown"
+	case strings.HasPrefix(ct, "text/plain"):
+		return "text"
+	case strings.HasPrefix(ct, "text/html"):
+		return "html"
+	case strings.HasPrefix(ct, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"):
+		return "docx"
+	default:
+		return "file"
+	}
 }
 
 // HandleIngestDocument accepts a document via either multipart/form-data
 // (field name: "file") or JSON body {"content": "...", "filename": "..."}.
 // Returns 202 Accepted with the document_id in "pending" state.
 func (h *DocumentsHandler) HandleIngestDocument(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := requireOrgID(w, r)
+	if !ok {
+		return
+	}
 	ctx := r.Context()
 	docID := ingest.NewDocumentID()
 
@@ -166,6 +219,7 @@ func (h *DocumentsHandler) HandleIngestDocument(w http.ResponseWriter, r *http.R
 
 	if err := h.db.NewDocument(ctx, db.Document{
 		ID:          docID,
+		OrgID:       orgID,
 		Title:       title,
 		ContentType: contentType,
 		SourceRef:   key,
@@ -201,8 +255,12 @@ func (h *DocumentsHandler) HandleIngestDocument(w http.ResponseWriter, r *http.R
 
 // HandleGetDocument returns metadata and lifecycle status for one document.
 func (h *DocumentsHandler) HandleGetDocument(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := requireOrgID(w, r)
+	if !ok {
+		return
+	}
 	id := tree.DocumentID(chi.URLParam(r, "id"))
-	doc, err := h.db.GetDocument(r.Context(), id)
+	doc, err := h.db.GetDocument(r.Context(), id, orgID)
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "document not found")
@@ -212,9 +270,11 @@ func (h *DocumentsHandler) HandleGetDocument(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
+		"doc_id":        doc.ID,
 		"id":            doc.ID,
 		"title":         doc.Title,
 		"content_type":  doc.ContentType,
+		"source_type":   sourceTypeFromContentType(doc.ContentType),
 		"status":        string(doc.Status),
 		"byte_size":     doc.ByteSize,
 		"error_message": doc.ErrorMessage,
@@ -226,8 +286,12 @@ func (h *DocumentsHandler) HandleGetDocument(w http.ResponseWriter, r *http.Requ
 
 // HandleDeleteDocument removes a document and cascades to its sections.
 func (h *DocumentsHandler) HandleDeleteDocument(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := requireOrgID(w, r)
+	if !ok {
+		return
+	}
 	id := tree.DocumentID(chi.URLParam(r, "id"))
-	if err := h.db.DeleteDocument(r.Context(), id); err != nil {
+	if err := h.db.DeleteDocument(r.Context(), id, orgID); err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "document not found")
 			return
@@ -238,10 +302,58 @@ func (h *DocumentsHandler) HandleDeleteDocument(w http.ResponseWriter, r *http.R
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// HandleGetDocumentSource streams the original document bytes back to the
+// caller. The document's SourceRef points to its location in storage.
+func (h *DocumentsHandler) HandleGetDocumentSource(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := requireOrgID(w, r)
+	if !ok {
+		return
+	}
+	id := tree.DocumentID(chi.URLParam(r, "id"))
+	doc, err := h.db.GetDocument(r.Context(), id, orgID)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "document not found")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if doc.SourceRef == "" {
+		writeErr(w, http.StatusNotFound, "document source not available")
+		return
+	}
+
+	rc, meta, err := h.storage.Get(r.Context(), doc.SourceRef)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "read source: "+err.Error())
+		return
+	}
+	defer rc.Close()
+
+	ct := doc.ContentType
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", ct)
+	if meta.Size > 0 {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", meta.Size))
+	}
+	if doc.Title != "" {
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, doc.Title))
+	}
+	w.WriteHeader(http.StatusOK)
+	io.Copy(w, rc)
+}
+
 // HandleGetTree returns the compact tree view used for LLM reasoning.
 func (h *DocumentsHandler) HandleGetTree(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := requireOrgID(w, r)
+	if !ok {
+		return
+	}
 	id := tree.DocumentID(chi.URLParam(r, "id"))
-	t, err := h.db.LoadTree(r.Context(), id)
+	t, err := h.db.LoadTree(r.Context(), id, orgID)
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "document not found")
@@ -255,8 +367,12 @@ func (h *DocumentsHandler) HandleGetTree(w http.ResponseWriter, r *http.Request)
 
 // HandleGetSection returns a single section with full content from storage.
 func (h *DocumentsHandler) HandleGetSection(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := requireOrgID(w, r)
+	if !ok {
+		return
+	}
 	id := tree.SectionID(chi.URLParam(r, "id"))
-	sec, err := h.db.GetSection(r.Context(), id)
+	sec, err := h.db.GetSection(r.Context(), id, orgID)
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "section not found")

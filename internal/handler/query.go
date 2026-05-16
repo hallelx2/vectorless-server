@@ -52,6 +52,10 @@ type queryRequest struct {
 // configured retrieval strategy, and returns the selected sections
 // with their full content.
 func (h *QueryHandler) HandleQuery(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := requireOrgID(w, r)
+	if !ok {
+		return
+	}
 	var body queryRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
@@ -66,7 +70,7 @@ func (h *QueryHandler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	t, err := h.db.LoadTree(r.Context(), body.DocumentID)
+	t, err := h.db.LoadTree(r.Context(), body.DocumentID, orgID)
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "document not found")
@@ -93,15 +97,37 @@ func (h *QueryHandler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	started := time.Now()
-	ids, err := h.strategy.Select(r.Context(), t, body.Query, budget)
-	if err != nil {
-		h.logger.Error("query: strategy failed",
-			"err", err,
-			"document_id", body.DocumentID,
-		)
-		writeErr(w, http.StatusInternalServerError, "retrieval failed: "+err.Error())
-		return
+
+	// Use CostStrategy if available to get token usage + cost.
+	var (
+		ids   []tree.SectionID
+		usage *retrieval.Usage
+	)
+	if cs, ok := h.strategy.(retrieval.CostStrategy); ok {
+		result, err := cs.SelectWithCost(r.Context(), t, body.Query, budget)
+		if err != nil {
+			h.logger.Error("query: strategy failed",
+				"err", err,
+				"document_id", body.DocumentID,
+			)
+			writeErr(w, http.StatusInternalServerError, "retrieval failed: "+err.Error())
+			return
+		}
+		ids = result.SelectedIDs
+		usage = &result.Usage
+	} else {
+		var err error
+		ids, err = h.strategy.Select(r.Context(), t, body.Query, budget)
+		if err != nil {
+			h.logger.Error("query: strategy failed",
+				"err", err,
+				"document_id", body.DocumentID,
+			)
+			writeErr(w, http.StatusInternalServerError, "retrieval failed: "+err.Error())
+			return
+		}
 	}
+
 	if body.MaxSections > 0 && len(ids) > body.MaxSections {
 		ids = ids[:body.MaxSections]
 	}
@@ -131,12 +157,22 @@ func (h *QueryHandler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"document_id": body.DocumentID,
 		"query":       body.Query,
 		"strategy":    h.strategy.Name(),
 		"model":       body.Model,
 		"sections":    sections,
 		"elapsed_ms":  time.Since(started).Milliseconds(),
-	})
+	}
+	if usage != nil {
+		resp["usage"] = map[string]any{
+			"input_tokens":  usage.InputTokens,
+			"output_tokens": usage.OutputTokens,
+			"total_tokens":  usage.TotalTokens,
+			"cost_usd":      usage.CostUSD,
+			"llm_calls":     usage.LLMCalls,
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
