@@ -38,6 +38,7 @@ import (
 
 	"github.com/hallelx2/vectorless-server/internal/config"
 	"github.com/hallelx2/vectorless-server/internal/handler"
+	"github.com/hallelx2/vectorless-server/internal/telemetry"
 
 	enginecfg "github.com/hallelx2/vectorless-engine/pkg/config"
 )
@@ -79,6 +80,28 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// ── OpenTelemetry tracing (optional) ──────────────────────────
+	if cfg.Tracing.Enabled {
+		shutdown, err := telemetry.InitTracer(ctx, telemetry.TracingConfig{
+			Endpoint:    cfg.Tracing.Endpoint,
+			Insecure:    cfg.Tracing.Insecure,
+			ServiceName: cfg.Tracing.ServiceName,
+			Version:     version,
+			SampleRate:  cfg.Tracing.SampleRate,
+		})
+		if err != nil {
+			return fmt.Errorf("init tracing: %w", err)
+		}
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := shutdown(shutdownCtx); err != nil {
+				logger.Warn("trace export shutdown error", "err", err)
+			}
+		}()
+		logger.Info("tracing: OTLP export enabled", "endpoint", cfg.Tracing.Endpoint)
+	}
+
 	// ── Database ──────────────────────────────────────────────────
 	pool, err := db.Open(ctx, cfg.Engine.Database.URL, int32(cfg.Engine.Database.MaxConns))
 	if err != nil {
@@ -110,6 +133,25 @@ func run() error {
 	}
 	strategy := buildStrategy(cfg.Engine.Retrieval, llmClient)
 
+	// Wrap with caching if enabled in engine config.
+	if cfg.Engine.Retrieval.Cache.Enabled {
+		ttl := time.Duration(cfg.Engine.Retrieval.Cache.TTLSeconds) * time.Second
+		if ttl == 0 {
+			ttl = 10 * time.Minute
+		}
+		strategy = retrieval.NewCached(strategy, retrieval.CachedConfig{
+			MaxEntries: cfg.Engine.Retrieval.Cache.MaxEntries,
+			TTL:        ttl,
+		})
+		logger.Info("retrieval: cache enabled",
+			"max_entries", cfg.Engine.Retrieval.Cache.MaxEntries,
+			"ttl_seconds", cfg.Engine.Retrieval.Cache.TTLSeconds,
+		)
+	}
+
+	// Multi-document query dispatcher.
+	multiDoc := retrieval.NewMultiDoc(strategy, pool.LoadTree)
+
 	// ── Ingest pipeline ───────────────────────────────────────────
 	pipeline := ingest.NewPipeline(ingest.Pipeline{
 		DB:      pool,
@@ -139,6 +181,7 @@ func run() error {
 			Storage:  store,
 			Queue:    q,
 			Strategy: strategy,
+			MultiDoc: multiDoc,
 			Version:  version,
 			Config:   cfg,
 		}
@@ -218,6 +261,12 @@ func buildStorage(c enginecfg.StorageConfig) (storage.Storage, error) {
 			AccessKey:    c.S3.AccessKey,
 			SecretKey:    c.S3.SecretKey,
 			UsePathStyle: c.S3.UsePathStyle,
+		})
+	case "gcs":
+		// Auths via Application Default Credentials — on Cloud Run
+		// that's the runtime SA via the metadata server.
+		return storage.NewGCS(context.Background(), storage.GCSConfig{
+			Bucket: c.GCS.Bucket,
 		})
 	default:
 		return nil, fmt.Errorf("unknown storage driver: %s", c.Driver)
