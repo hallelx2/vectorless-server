@@ -269,6 +269,12 @@ func (h *DocumentsHandler) HandleGetDocument(w http.ResponseWriter, r *http.Requ
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Section count is fire-and-forget — if it fails we still return
+	// the rest of the doc rather than failing the whole GET.
+	sectionCount := 0
+	if n, cerr := h.db.CountSections(r.Context(), id); cerr == nil {
+		sectionCount = n
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"doc_id":        doc.ID,
 		"id":            doc.ID,
@@ -277,6 +283,7 @@ func (h *DocumentsHandler) HandleGetDocument(w http.ResponseWriter, r *http.Requ
 		"source_type":   sourceTypeFromContentType(doc.ContentType),
 		"status":        string(doc.Status),
 		"byte_size":     doc.ByteSize,
+		"section_count": sectionCount,
 		"error_message": doc.ErrorMessage,
 		"metadata":      doc.Metadata,
 		"created_at":    doc.CreatedAt,
