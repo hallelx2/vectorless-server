@@ -55,6 +55,14 @@ func requireOrgID(w http.ResponseWriter, r *http.Request) (string, bool) {
 	return org, true
 }
 
+// storeID pulls the optional X-Vectorless-Store header. Unlike org,
+// store is optional: an empty result means "don't scope by store"
+// (header-less / pre-stores callers see the whole org). The control
+// plane injects this once stores are wired.
+func storeID(r *http.Request) string {
+	return r.Header.Get("X-Vectorless-Store")
+}
+
 // HandleListDocuments returns a paginated list of documents for the
 // org identified by the X-Vectorless-Org header.
 //
@@ -69,8 +77,9 @@ func (h *DocumentsHandler) HandleListDocuments(w http.ResponseWriter, r *http.Re
 	}
 	q := r.URL.Query()
 	opts := db.ListDocumentsOpts{
-		OrgID:  orgID,
-		Status: db.DocumentStatus(q.Get("status")),
+		OrgID:   orgID,
+		StoreID: storeID(r),
+		Status:  db.DocumentStatus(q.Get("status")),
 	}
 	if v := q.Get("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -220,6 +229,7 @@ func (h *DocumentsHandler) HandleIngestDocument(w http.ResponseWriter, r *http.R
 	if err := h.db.NewDocument(ctx, db.Document{
 		ID:          docID,
 		OrgID:       orgID,
+		StoreID:     storeID(r),
 		Title:       title,
 		ContentType: contentType,
 		SourceRef:   key,
@@ -260,7 +270,7 @@ func (h *DocumentsHandler) HandleGetDocument(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	id := tree.DocumentID(chi.URLParam(r, "id"))
-	doc, err := h.db.GetDocument(r.Context(), id, orgID)
+	doc, err := h.db.GetDocument(r.Context(), id, orgID, storeID(r))
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "document not found")
@@ -272,7 +282,7 @@ func (h *DocumentsHandler) HandleGetDocument(w http.ResponseWriter, r *http.Requ
 	// Section count is fire-and-forget — if it fails we still return
 	// the rest of the doc rather than failing the whole GET.
 	sectionCount := 0
-	if n, cerr := h.db.CountSections(r.Context(), id); cerr == nil {
+	if n, cerr := h.db.CountSections(r.Context(), id, orgID, storeID(r)); cerr == nil {
 		sectionCount = n
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -298,7 +308,7 @@ func (h *DocumentsHandler) HandleDeleteDocument(w http.ResponseWriter, r *http.R
 		return
 	}
 	id := tree.DocumentID(chi.URLParam(r, "id"))
-	if err := h.db.DeleteDocument(r.Context(), id, orgID); err != nil {
+	if err := h.db.DeleteDocument(r.Context(), id, orgID, storeID(r)); err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "document not found")
 			return
@@ -317,7 +327,7 @@ func (h *DocumentsHandler) HandleGetDocumentSource(w http.ResponseWriter, r *htt
 		return
 	}
 	id := tree.DocumentID(chi.URLParam(r, "id"))
-	doc, err := h.db.GetDocument(r.Context(), id, orgID)
+	doc, err := h.db.GetDocument(r.Context(), id, orgID, storeID(r))
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "document not found")
@@ -360,7 +370,7 @@ func (h *DocumentsHandler) HandleGetTree(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	id := tree.DocumentID(chi.URLParam(r, "id"))
-	t, err := h.db.LoadTree(r.Context(), id, orgID)
+	t, err := h.db.LoadTree(r.Context(), id, orgID, storeID(r))
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "document not found")
@@ -379,7 +389,7 @@ func (h *DocumentsHandler) HandleGetSection(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	id := tree.SectionID(chi.URLParam(r, "id"))
-	sec, err := h.db.GetSection(r.Context(), id, orgID)
+	sec, err := h.db.GetSection(r.Context(), id, orgID, storeID(r))
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "section not found")

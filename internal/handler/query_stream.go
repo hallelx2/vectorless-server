@@ -79,7 +79,7 @@ func (h *QueryStreamHandler) HandleQueryStream(w http.ResponseWriter, r *http.Re
 
 	ctx := r.Context()
 
-	t, err := h.db.LoadTree(ctx, body.DocumentID, orgID)
+	t, err := h.db.LoadTree(ctx, body.DocumentID, orgID, storeID(r))
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "document not found")

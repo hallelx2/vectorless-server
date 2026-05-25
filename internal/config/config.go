@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -46,6 +47,12 @@ type Config struct {
 
 	// RateLimit configures optional global rate limiting.
 	RateLimit RateLimitConfig `yaml:"rate_limit"`
+
+	// CORS configures Cross-Origin Resource Sharing headers.
+	CORS CORSConfig `yaml:"cors"`
+
+	// Governance configures request size limits and timeouts.
+	Governance GovernanceConfig `yaml:"governance"`
 }
 
 // ServerConfig configures the HTTP server.
@@ -128,8 +135,43 @@ type RateLimitConfig struct {
 	Enabled bool `yaml:"enabled"`
 
 	// RequestsPerMinute is the maximum number of requests per minute
-	// across all clients. Default 600.
+	// across all clients (global bucket). Default 600.
 	RequestsPerMinute int `yaml:"requests_per_minute"`
+
+	// PerPrincipalRPM is the per-principal rate limit. Each
+	// authenticated principal gets their own bucket. 0 = disabled.
+	PerPrincipalRPM int `yaml:"per_principal_rpm"`
+}
+
+// CORSConfig configures Cross-Origin Resource Sharing headers.
+type CORSConfig struct {
+	// Enabled toggles CORS header injection. Default true.
+	Enabled bool `yaml:"enabled"`
+
+	// AllowedOrigins is the list of origins allowed to make cross-origin
+	// requests. Use ["*"] to allow any origin (suitable for development).
+	AllowedOrigins []string `yaml:"allowed_origins"`
+
+	// MaxAge is the Access-Control-Max-Age value in seconds. Browsers
+	// cache preflight responses for this duration. Default 86400 (24h).
+	MaxAge int `yaml:"max_age"`
+}
+
+// GovernanceConfig configures request body size limits and per-request
+// timeouts.
+type GovernanceConfig struct {
+	// MaxBodySizeBytes is the maximum allowed request body size.
+	// Default 33554432 (32 MiB), suitable for multipart uploads.
+	MaxBodySizeBytes int64 `yaml:"max_body_size_bytes"`
+
+	// DefaultTimeout is the per-request context deadline for most
+	// endpoints. Default 30s.
+	DefaultTimeout time.Duration `yaml:"default_timeout"`
+
+	// QueryTimeout is the per-request context deadline for query
+	// endpoints, which typically involve embedding + retrieval.
+	// Default 120s.
+	QueryTimeout time.Duration `yaml:"query_timeout"`
 }
 
 // Default returns a Config with sensible defaults.
@@ -156,6 +198,16 @@ func Default() Config {
 		RateLimit: RateLimitConfig{
 			Enabled:           false,
 			RequestsPerMinute: 600,
+		},
+		CORS: CORSConfig{
+			Enabled:        true,
+			AllowedOrigins: []string{"*"},
+			MaxAge:         86400,
+		},
+		Governance: GovernanceConfig{
+			MaxBodySizeBytes: 33554432,       // 32 MiB
+			DefaultTimeout:   30 * time.Second,
+			QueryTimeout:     120 * time.Second,
 		},
 	}
 }
@@ -221,6 +273,14 @@ func applyEnvOverrides(c *Config) {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			c.RateLimit.RequestsPerMinute = n
 		}
+	}
+
+	// ── CORS ──────────────────────────────────────────────────────
+	if v := os.Getenv("VLS_CORS_ENABLED"); v != "" {
+		c.CORS.Enabled = v == "true" || v == "1"
+	}
+	if v := os.Getenv("VLS_CORS_ORIGINS"); v != "" {
+		c.CORS.AllowedOrigins = strings.Split(v, ",")
 	}
 
 	// ── TLS ───────────────────────────────────────────────────────

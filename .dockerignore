@@ -1,0 +1,16 @@
+bin/
+data/
+docs/
+testdata/
+scripts/
+proto/
+.git/
+.vscode/
+.idea/
+*.md
+*.yaml
+*.yml
+!go.sum
+.env
+.env.*
+.gitignore

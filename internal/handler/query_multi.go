@@ -85,7 +85,7 @@ func (h *QueryMultiHandler) HandleQueryMulti(w http.ResponseWriter, r *http.Requ
 	}
 
 	started := time.Now()
-	result, err := h.multiDoc.Query(r.Context(), orgID, body.DocumentIDs, body.Query, budget)
+	result, err := h.multiDoc.Query(r.Context(), orgID, storeID(r), body.DocumentIDs, body.Query, budget)
 	if err != nil {
 		h.logger.Error("query/multi: failed", "err", err)
 		writeErr(w, http.StatusInternalServerError, "multi-doc retrieval failed: "+err.Error())

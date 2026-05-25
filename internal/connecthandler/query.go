@@ -63,7 +63,7 @@ func (s *QueryService) Query(
 		return nil, connect.NewError(connect.CodeUnavailable, nil)
 	}
 
-	t, err := s.db.LoadTree(ctx, tree.DocumentID(msg.DocumentId), orgID)
+	t, err := s.db.LoadTree(ctx, tree.DocumentID(msg.DocumentId), orgID, storeIDFromConnect(req))
 	if err != nil {
 		if isNotFound(err) {
 			return nil, connect.NewError(connect.CodeNotFound, err)
@@ -167,7 +167,7 @@ func (s *QueryService) QueryMulti(
 	}
 
 	started := time.Now()
-	result, err := s.multiDoc.Query(ctx, orgID, docIDs, msg.Query, budget)
+	result, err := s.multiDoc.Query(ctx, orgID, storeIDFromConnect(req), docIDs, msg.Query, budget)
 	if err != nil {
 		s.logger.Error("query/multi: failed", "err", err)
 		return nil, connect.NewError(connect.CodeInternal, err)
@@ -271,7 +271,7 @@ func (s *QueryService) QueryMultiStream(
 		docIDs[i] = tree.DocumentID(id)
 	}
 
-	events := s.multiDoc.QueryStream(ctx, orgID, docIDs, msg.Query, budget)
+	events := s.multiDoc.QueryStream(ctx, orgID, storeIDFromConnect(req), docIDs, msg.Query, budget)
 
 	for mevt := range events {
 		evt := mevt.Event

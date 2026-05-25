@@ -96,7 +96,7 @@ func (h *QueryStreamMultiHandler) HandleQueryStreamMulti(w http.ResponseWriter, 
 	flusher, canFlush := w.(http.Flusher)
 
 	started := time.Now()
-	events := h.multiDoc.QueryStream(r.Context(), orgID, body.DocumentIDs, body.Query, budget)
+	events := h.multiDoc.QueryStream(r.Context(), orgID, storeID(r), body.DocumentIDs, body.Query, budget)
 
 	for mevt := range events {
 		evt := mevt.Event

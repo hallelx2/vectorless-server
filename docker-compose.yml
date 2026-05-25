@@ -55,7 +55,8 @@ services:
   # ── Vectorless Server ──────────────────────────────────────────
   server:
     build:
-      context: .
+      context: ..
+      dockerfile: vectorless-server/Dockerfile
       args:
         VERSION: "dev-compose"
     depends_on:

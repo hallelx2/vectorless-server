@@ -70,7 +70,7 @@ func (h *QueryHandler) HandleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	t, err := h.db.LoadTree(r.Context(), body.DocumentID, orgID)
+	t, err := h.db.LoadTree(r.Context(), body.DocumentID, orgID, storeID(r))
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "document not found")

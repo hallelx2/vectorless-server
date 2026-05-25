@@ -35,6 +35,14 @@ func orgIDFromConnect(req connect.AnyRequest) (string, error) {
 	return org, nil
 }
 
+// storeIDFromConnect pulls the X-Vectorless-Store header that the control
+// plane proxy injects to scope a request to a single store. Unlike the
+// org header it is optional: an empty value means "no store filter"
+// (org-wide), which the db layer treats as a wildcard.
+func storeIDFromConnect(req connect.AnyRequest) string {
+	return req.Header().Get("X-Vectorless-Store")
+}
+
 // DocumentsService implements vectorlessv1connect.DocumentsServiceHandler.
 type DocumentsService struct {
 	vectorlessv1connect.UnimplementedDocumentsServiceHandler
@@ -99,6 +107,7 @@ func (s *DocumentsService) CreateDocument(
 	if err := s.db.NewDocument(ctx, db.Document{
 		ID:          docID,
 		OrgID:       orgID,
+		StoreID:     storeIDFromConnect(req),
 		Title:       title,
 		ContentType: contentType,
 		SourceRef:   key,
@@ -139,7 +148,7 @@ func (s *DocumentsService) GetDocument(
 	if err != nil {
 		return nil, err
 	}
-	doc, err := s.db.GetDocument(ctx, tree.DocumentID(req.Msg.DocumentId), orgID)
+	doc, err := s.db.GetDocument(ctx, tree.DocumentID(req.Msg.DocumentId), orgID, storeIDFromConnect(req))
 	if err != nil {
 		if isNotFound(err) {
 			return nil, connect.NewError(connect.CodeNotFound, err)
@@ -160,9 +169,10 @@ func (s *DocumentsService) ListDocuments(
 	}
 	msg := req.Msg
 	opts := db.ListDocumentsOpts{
-		OrgID:  orgID,
-		Limit:  int(msg.Limit),
-		Status: db.DocumentStatus(msg.Status),
+		OrgID:   orgID,
+		StoreID: storeIDFromConnect(req),
+		Limit:   int(msg.Limit),
+		Status:  db.DocumentStatus(msg.Status),
 	}
 	if msg.Cursor != "" {
 		if t, err := time.Parse(time.RFC3339Nano, msg.Cursor); err == nil {
@@ -196,7 +206,7 @@ func (s *DocumentsService) DeleteDocument(
 	if err != nil {
 		return nil, err
 	}
-	if err := s.db.DeleteDocument(ctx, tree.DocumentID(req.Msg.DocumentId), orgID); err != nil {
+	if err := s.db.DeleteDocument(ctx, tree.DocumentID(req.Msg.DocumentId), orgID, storeIDFromConnect(req)); err != nil {
 		if isNotFound(err) {
 			return nil, connect.NewError(connect.CodeNotFound, err)
 		}
@@ -214,7 +224,7 @@ func (s *DocumentsService) GetDocumentTree(
 	if err != nil {
 		return nil, err
 	}
-	t, err := s.db.LoadTree(ctx, tree.DocumentID(req.Msg.DocumentId), orgID)
+	t, err := s.db.LoadTree(ctx, tree.DocumentID(req.Msg.DocumentId), orgID, storeIDFromConnect(req))
 	if err != nil {
 		if isNotFound(err) {
 			return nil, connect.NewError(connect.CodeNotFound, err)
@@ -258,7 +268,7 @@ func (s *DocumentsService) GetDocumentSource(
 		return err
 	}
 	docID := tree.DocumentID(req.Msg.DocumentId)
-	doc, err := s.db.GetDocument(ctx, docID, orgID)
+	doc, err := s.db.GetDocument(ctx, docID, orgID, storeIDFromConnect(req))
 	if err != nil {
 		if isNotFound(err) {
 			return connect.NewError(connect.CodeNotFound, err)
@@ -305,7 +315,7 @@ func (s *DocumentsService) GetSection(
 	if err != nil {
 		return nil, err
 	}
-	sec, err := s.db.GetSection(ctx, tree.SectionID(req.Msg.SectionId), orgID)
+	sec, err := s.db.GetSection(ctx, tree.SectionID(req.Msg.SectionId), orgID, storeIDFromConnect(req))
 	if err != nil {
 		if isNotFound(err) {
 			return nil, connect.NewError(connect.CodeNotFound, err)

@@ -36,7 +36,7 @@ func (s *QueryService) QueryStream(
 		return connect.NewError(connect.CodeUnimplemented, nil)
 	}
 
-	t, err := s.db.LoadTree(ctx, tree.DocumentID(msg.DocumentId), orgID)
+	t, err := s.db.LoadTree(ctx, tree.DocumentID(msg.DocumentId), orgID, storeIDFromConnect(req))
 	if err != nil {
 		if isNotFound(err) {
 			return connect.NewError(connect.CodeNotFound, err)
